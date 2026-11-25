@@ -16,12 +16,17 @@ import (
 // removed otherwise it is left unchanged. To remove all items with a
 // particular key simply:
 //
-// 	err = bpt.Remove(key, func(value []byte) bool { return true })
-// 	if err != nil {
-// 		panic(err)
-// 	}
-//
+//	err = bpt.Remove(key, func(value []byte) bool { return true })
+//	if err != nil {
+//		panic(err)
+//	}
 func (self *BpTree) Remove(key []byte, where func([]byte) bool) (err error) {
+	oldMeta := self.meta.Clone()
+	if tx := self.bf.UndoTransaction(); tx != nil {
+		tx.OnRollback(func() {
+			self.meta = oldMeta
+		})
+	}
 	cntDelta, root, err := self.remove(self.meta.root, key, where)
 	if err != nil {
 		return err

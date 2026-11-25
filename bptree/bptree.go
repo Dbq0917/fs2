@@ -95,7 +95,7 @@ func (m *bpTreeMeta) CopyInto(o *bpTreeMeta) {
 }
 
 func (b *BpTree) doMeta(do func(*bpTreeMeta) error) error {
-	return b.bf.Do(b.metaOff, 1, func(data []byte) error {
+	return b.bf.UndoDo(b.metaOff, 1, func(data []byte) error {
 		meta := (*bpTreeMeta)(slice.AsSlice(&data).Array)
 		return do(meta)
 	})

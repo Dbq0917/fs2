@@ -87,6 +87,13 @@ type BlockFile struct {
 	file        *os.File
 	mmap        unsafe.Pointer
 	outstanding int "total outstanding pointers"
+
+	allocCount  int64
+	allocLimit  int64
+	quotaSet    bool
+	beforeAlloc func(blocks int) error
+	undo        *UndoTx
+	journalBase uint64
 }
 
 // Zero the bytes of the passed in slice. It uses the length not the
@@ -185,6 +192,9 @@ func OpenBlockFile(path string) (*BlockFile, error) {
 		return nil, err
 	}
 	bf.blksize = int(blksize)
+	if err := bf.recoverTx(); err != nil {
+		return nil, err
+	}
 	return bf, nil
 }
 
@@ -414,6 +424,9 @@ func (self *BlockFile) anonResize(size uint64) error {
 // Free the block at the given offset. The offset is in bytes from the
 // start of the file.
 func (self *BlockFile) Free(offset uint64) error {
+	if self.undo != nil {
+		self.undo.trackFree(offset)
+	}
 	/*
 		errno := C.is_normal(self.mmap, C.size_t(offset), C.size_t(self.blksize))
 		if errno != 0 {
@@ -510,6 +523,9 @@ func (self *BlockFile) Allocate() (offset uint64, err error) {
 	if !self.opened {
 		return 0, errors.Errorf("File is not open")
 	}
+	if err := self.checkAllocation(1); err != nil {
+		return 0, err
+	}
 	var resize bool = false
 	err = self.ctrl(func(ctrl *ctrlblk) error {
 		var err error
@@ -529,7 +545,11 @@ func (self *BlockFile) Allocate() (offset uint64, err error) {
 			return 0, err
 		}
 	}
-	return self.zero(offset, 1)
+	if err := self.undo.trackAllocation(offset, 1); err != nil {
+		return offset, err
+	}
+	_, err = self.zero(offset, 1)
+	return offset, err
 }
 
 // Allocate n blocks. Return the offset of the first block. These are
@@ -539,16 +559,23 @@ func (self *BlockFile) AllocateBlocks(n int) (offset uint64, err error) {
 	if !self.opened {
 		return 0, errors.Errorf("File is not open")
 	}
+	if err := self.checkAllocation(n); err != nil {
+		return 0, err
+	}
 	offset, err = self.alloc(n)
 	if err != nil {
 		return 0, err
+	}
+	if err := self.undo.trackAllocation(offset, n); err != nil {
+		return offset, err
 	}
 	/*amt := uint64(self.blksize) * uint64(n)
 	errno := C.is_sequential(self.mmap, C.size_t(offset), C.size_t(amt))
 	if errno != 0 {
 		return 0, errors.Errorf("is_sequential failed, %d", errno)
 	}*/
-	return self.zero(offset, n)
+	_, err = self.zero(offset, n)
+	return offset, err
 }
 
 // Load the blocks at the give offset then call the callback, `do`,

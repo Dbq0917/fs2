@@ -24,7 +24,7 @@ func (self *BpTree) new(init func([]byte) error) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	err = self.bf.Do(a, 1, func(bytes []byte) error {
+	err = self.bf.UndoDo(a, 1, func(bytes []byte) error {
 		return init(bytes)
 	})
 	if err != nil {
@@ -95,7 +95,7 @@ func (self *BpTree) do(
 	internalDo func(*internal) error,
 	leafDo func(*leaf) error,
 ) error {
-	return self.bf.Do(a, 1, func(bytes []byte) error {
+	return self.bf.UndoDo(a, 1, func(bytes []byte) error {
 		flags := consts.AsFlag(bytes)
 		if flags&consts.INTERNAL != 0 {
 			return internalDo(asInternal(bytes))

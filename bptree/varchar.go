@@ -147,7 +147,7 @@ func NewVarchar(bf *fmap.BlockFile, a uint64) (v *Varchar, err error) {
 		a:        a,
 		blkSize:  bf.BlockSize(),
 	}
-	err = v.bf.Do(v.a, 1, func(bytes []byte) error {
+	err = v.bf.UndoDo(v.a, 1, func(bytes []byte) error {
 		ctrl := asCtrl(bytes)
 		ctrl.Init(ptOff, szOff)
 		return nil
@@ -165,7 +165,7 @@ func OpenVarchar(bf *fmap.BlockFile, a uint64) (v *Varchar, err error) {
 	v = &Varchar{bf: bf, a: a, blkSize: bf.BlockSize()}
 	var ptOff uint64
 	var szOff uint64
-	err = v.bf.Do(v.a, 1, func(bytes []byte) error {
+	err = v.bf.UndoDo(v.a, 1, func(bytes []byte) error {
 		ctrl := asCtrl(bytes)
 		if ctrl.flags&consts.VARCHAR_CTRL == 0 {
 			return errors.Errorf("Expected a Varchar control block")
@@ -442,15 +442,15 @@ func (v *Varchar) indexRemove(length int, a uint64) error {
 //
 // The right way:
 //
-// 	var myBytes []byte
-// 	err = v.Do(a, func(bytes []byte) error {
-// 		myBytes = make([]byte, len(bytes))
-// 		copy(myBytes, bytes)
-// 		return nil
-// 	})
-// 	if err != nil {
-// 		log.Fatal(err)
-// 	}
+//	var myBytes []byte
+//	err = v.Do(a, func(bytes []byte) error {
+//		myBytes = make([]byte, len(bytes))
+//		copy(myBytes, bytes)
+//		return nil
+//	})
+//	if err != nil {
+//		log.Fatal(err)
+//	}
 //
 // you can of course interact with the bytes in the callback in any way
 // you want as long as no pointers escape. You can even change the
@@ -471,7 +471,7 @@ func (v *Varchar) Do(a uint64, do func([]byte) error) (err error) {
 		for start+blks*uint64(v.bf.BlockSize()) > uint64(size) {
 			blks--
 		}
-		return v.bf.Do(start, blks, func(bytes []byte) error {
+		return v.bf.UndoDo(start, blks, func(bytes []byte) error {
 			bytes = bytes[offset:]
 			flags := consts.AsFlag(bytes)
 			if flags&consts.VARCHAR_RUN == 0 {
@@ -617,7 +617,7 @@ func (v *Varchar) do(
 	runDo func(*varRunMeta) error,
 ) error {
 	offset, start, blks := v.startOffsetBlks(a)
-	return v.bf.Do(start, blks, func(bytes []byte) error {
+	return v.bf.UndoDo(start, blks, func(bytes []byte) error {
 		bytes = bytes[offset:]
 		flags := consts.AsFlag(bytes)
 		if flags == consts.VARCHAR_CTRL {
@@ -649,7 +649,7 @@ func (v *Varchar) unsafeGet(a uint64) ([]byte, error) {
 // want to use doFree.
 func (v *Varchar) doAsFree(a uint64, do func(*varFree) error) error {
 	offset, start, blks := v.startOffsetBlks(a)
-	return v.bf.Do(start, blks, func(bytes []byte) error {
+	return v.bf.UndoDo(start, blks, func(bytes []byte) error {
 		bytes = bytes[offset:]
 		return do(asFree(bytes))
 	})
@@ -672,7 +672,7 @@ func (v *Varchar) newFree(a uint64, length int) error {
 // want to use doRun.
 func (v *Varchar) doAsRun(a uint64, do func(*varRunMeta) error) error {
 	offset, start, blks := v.startOffsetBlks(a)
-	return v.bf.Do(start, blks, func(bytes []byte) error {
+	return v.bf.UndoDo(start, blks, func(bytes []byte) error {
 		bytes = bytes[offset:]
 		return do(asRunMeta(bytes))
 	})
@@ -681,7 +681,9 @@ func (v *Varchar) doAsRun(a uint64, do func(*varRunMeta) error) error {
 // a == address of the start of the segment
 // length == the requested length of the block
 // fullLength == the length + meta data for the run. This is what is
-//               actually allocated
+//
+//	actually allocated
+//
 // segLength == the length of the segment we are allocating in
 func (v *Varchar) newRun(a uint64, length, fullLength, segLength int) (err error) {
 	if fullLength > segLength {

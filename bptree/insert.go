@@ -45,6 +45,28 @@ store.
 // tree. It only adds this key. The B+ Tree supports duplicate keys and
 // even duplicate keys with the same value!
 func (self *BpTree) Add(key, value []byte) (err error) {
+	oldMeta := self.meta.Clone()
+	undo, err := self.bf.BeginTx()
+	if err != nil {
+		return err
+	}
+	undo.OnRollback(func() {
+		self.meta = oldMeta
+	})
+	committed := false
+	defer func() {
+		if r := recover(); r != nil {
+			_ = undo.Rollback()
+			self.meta = oldMeta
+			panic(r)
+		}
+		if err != nil || !committed {
+			if rbErr := undo.Rollback(); rbErr != nil {
+				log.Printf("rollback error: %v", rbErr)
+			}
+			self.meta = oldMeta
+		}
+	}()
 	if len(key) != int(self.meta.keySize) && self.meta.flags&consts.VARCHAR_KEYS == 0 {
 		return errors.Errorf("Key was not the correct size got, %v, expected, %v", len(key), self.meta.keySize)
 	}
@@ -58,7 +80,15 @@ func (self *BpTree) Add(key, value []byte) (err error) {
 	}
 	self.meta.itemCount += cntDelta
 	self.meta.root = root
-	return self.writeMeta()
+	err = self.writeMeta()
+	if err != nil {
+		return err
+	}
+	if err = undo.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 func (self *BpTree) add(root uint64, key, value []byte, allowDups bool) (cntDelta, newRoot uint64, err error) {
@@ -247,23 +277,34 @@ func (self *BpTree) leafInsert(n uint64, key, value []byte, allowDups bool) (a, 
 // rouge insert. This would result in the items in the chained blocks being
 // "lost". The solution is the block is pure if
 //
-// 1.   All the keys are the same
-// 2.   It has at least 1 key
-// 3.      ( It has more than 2 keys )
-//      OR ( It has less than 3 keys AND a chained block after it )
+//  1. All the keys are the same
+//  2. It has at least 1 key
+//  3. ( It has more than 2 keys )
+//     OR ( It has less than 3 keys AND a chained block after it )
 //
 // if empty,
-//          then (do the put)
+//
+//	then (do the put)
+//
 // if   pure,   full,   sameKey
-//          then (go to the end and do the put)
+//
+//	then (go to the end and do the put)
+//
 // If   pure, ! full,   sameKey
-//          then (do the put)
+//
+//	then (do the put)
+//
 // if   pure, ! sameKey
-//          then (do a leafSplit)
+//
+//	then (do a leafSplit)
+//
 // if ! pure,   full
-//          then (do a leafSplit)
+//
+//	then (do a leafSplit)
+//
 // if ! pure, ! full,
-//          then (do the put)
+//
+//	then (do the put)
 func (self *BpTree) leafDupAllowInsert(n uint64, vkey, key, value []byte) (a, b uint64, err error) {
 	// log.Println("leafDupAllowInsert", n, key)
 	var mustSplit bool = false
@@ -353,11 +394,10 @@ func (self *BpTree) leafNoDupInsert(n uint64, vkey, key, value []byte) (a, b uin
 
 // The block is pure if
 //
-// 1.   All the keys are the same
-// 2.   It has at least 1 key
-// 3.      ( It has more than 2 keys )
-//      OR ( It has less than 3 keys AND a chained block after it )
-//
+//  1. All the keys are the same
+//  2. It has at least 1 key
+//  3. ( It has more than 2 keys )
+//     OR ( It has less than 3 keys AND a chained block after it )
 func (self *BpTree) isPure(a uint64) (pure bool, err error) {
 	err = self.doLeaf(a, func(n *leaf) (err error) {
 		count := n.keyCount()

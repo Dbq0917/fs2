@@ -367,7 +367,7 @@ func (n *internal) putKey(v *Varchar, key []byte, put func(i int) error) (err er
 	} else if i >= int(n.meta.keyCap) {
 		return errors.Errorf("find returned a int > than len(keys)")
 	} else if has {
-		return errors.Errorf(fmt.Sprintf("would have inserted a duplicate key, %v", key))
+		return errors.Errorf("would have inserted a duplicate key, %v", key)
 	}
 	if err := n.putKeyAt(key, i); err != nil {
 		return err
