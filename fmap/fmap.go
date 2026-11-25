@@ -20,13 +20,42 @@ import (
 
 const BLOCKSIZE = 4096
 
-type freeblk struct {
-	next uint64
+// freeMagic marks the on-disk structures of a free run. Its little
+// endian byte representation is the ASCII string "FREEBLK1".
+const freeMagic uint64 = 0x314b4c4245455246
+
+// A freeblkHdr is stored in the first block of every free run. A free
+// run is a maximal sequence of adjacent free blocks. The runs are kept
+// in a doubly linked list so a run can be unlinked in O(1) while
+// coalescing neighbors during a Free.
+type freeblkHdr struct {
+	magic  uint64 // always freeMagic for the start of a free run
+	prev   uint64 // offset of the previous free run (0 == list head)
+	next   uint64 // offset of the next free run (0 == list tail)
+	length uint64 // length of the run in blocks
 }
 
-func loadFreeBlk(bytes []byte) *freeblk {
-	free_s := slice.AsSlice(&bytes)
-	return (*freeblk)(free_s.Array)
+const freeHdrSize = 32
+
+// A freeblkFtr is stored in the last block of every free run. It lets
+// Free find the run immediately preceding a newly freed block in O(1)
+// without scanning the whole free list (a boundary tag).
+type freeblkFtr struct {
+	magic uint64 // always freeMagic on the last block of a run
+	head  uint64 // offset of the first block of the run
+}
+
+const freeFtrSize = 16
+
+func loadFreeHdr(bytes []byte) *freeblkHdr {
+	back := slice.AsSlice(&bytes)
+	return (*freeblkHdr)(back.Array)
+}
+
+func loadFreeFtr(block []byte) *freeblkFtr {
+	back := slice.AsSlice(&block)
+	ptr := unsafe.Pointer(uintptr(back.Array) + uintptr(len(block)-freeFtrSize))
+	return (*freeblkFtr)(ptr)
 }
 
 type ctrldata struct {
@@ -45,6 +74,14 @@ func init() {
 	ctrldataSizeActual = int(c.Size())
 	if ctrldataSizeActual != ctrldataSize {
 		panic("the ctrldataSize was an unexpected size")
+	}
+	var h freeblkHdr
+	if int(reflect.TypeOf(h).Size()) != freeHdrSize {
+		panic("the freeblkHdr was an unexpected size")
+	}
+	var f freeblkFtr
+	if int(reflect.TypeOf(f).Size()) != freeFtrSize {
+		panic("the freeblkFtr was an unexpected size")
 	}
 }
 
@@ -411,47 +448,405 @@ func (self *BlockFile) anonResize(size uint64) error {
 	return nil
 }
 
-// Free the block at the given offset. The offset is in bytes from the
-// start of the file.
-func (self *BlockFile) Free(offset uint64) error {
-	/*
-		errno := C.is_normal(self.mmap, C.size_t(offset), C.size_t(self.blksize))
-		if errno != 0 {
-			return errors.Errorf("is_normal failed, %d", errno)
-		}*/
-	_, err := self.zero(offset, 1)
-	if err != nil {
-		return err
+// blockOffset converts a block index into a byte offset.
+func (self *BlockFile) blockOffset(index uint64) uint64 {
+	return index * uint64(self.blksize)
+}
+
+// offsetIndex converts a byte offset into a block index.
+func (self *BlockFile) offsetIndex(offset uint64) uint64 {
+	return offset / uint64(self.blksize)
+}
+
+// validBlock reports whether the block index is inside the mapped
+// region (block 0 is the control block and is never free).
+func (self *BlockFile) validBlock(index uint64) bool {
+	if index == 0 {
+		return false
 	}
-	return self.ctrl(func(ctrl *ctrlblk) error {
-		head := ctrl.meta.free_head
-		return self.Do(offset, 1, func(free_bytes []byte) error {
-			free := loadFreeBlk(free_bytes)
-			free.next = head
-			ctrl.meta.free_head = offset
-			ctrl.meta.free_len += 1
+	return self.blockOffset(index)+uint64(self.blksize) <= self.size
+}
+
+// readFreeHdr loads the free run header at the given offset. It returns
+// an error when the block is not the start of a free run.
+func (self *BlockFile) readFreeHdr(offset uint64) (head, length uint64, err error) {
+	err = self.Do(offset, 1, func(bytes []byte) error {
+		hdr := loadFreeHdr(bytes)
+		if hdr.magic != freeMagic {
+			return errors.Errorf("block at %d is not the start of a free run", offset)
+		}
+		head = offset
+		length = hdr.length
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return head, length, nil
+}
+
+// nextFreeRun returns the free run starting at the block following
+// blockIndex when one exists there. Allocated blocks do not carry the
+// free magic, so this is an O(1) neighbor lookup rather than a scan.
+func (self *BlockFile) nextFreeRun(blockIndex uint64) (head, length uint64, found bool, err error) {
+	nextIndex := blockIndex + 1
+	if !self.validBlock(nextIndex) {
+		return 0, 0, false, nil
+	}
+	offset := self.blockOffset(nextIndex)
+	err = self.Do(offset, 1, func(bytes []byte) error {
+		hdr := loadFreeHdr(bytes)
+		if hdr.magic != freeMagic {
+			return nil
+		}
+		found = true
+		head = offset
+		length = hdr.length
+		return nil
+	})
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return head, length, found, nil
+}
+
+// prevFreeRun returns the free run ending on the block preceding
+// blockIndex. The boundary tag (footer) in that last block points back
+// at the run's header, making the backward lookup O(1).
+func (self *BlockFile) prevFreeRun(blockIndex uint64) (head, length uint64, found bool, err error) {
+	prevIndex := blockIndex - 1
+	if blockIndex == 0 || !self.validBlock(prevIndex) {
+		return 0, 0, false, nil
+	}
+	prevOffset := self.blockOffset(prevIndex)
+	err = self.Do(prevOffset, 1, func(block []byte) error {
+		ftr := loadFreeFtr(block)
+		if ftr.magic != freeMagic {
+			return nil
+		}
+		var lerr error
+		head, length, lerr = self.readFreeHdr(ftr.head)
+		if lerr != nil {
+			return lerr
+		}
+		// Guard against an allocated block whose bytes happen to match
+		// the footer magic: the referenced run must actually end here.
+		if self.offsetIndex(head)+length != prevIndex+1 {
+			found = false
+			head, length = 0, 0
+			return nil
+		}
+		found = true
+		return nil
+	})
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return head, length, found, nil
+}
+
+// writeFreeRun writes the header of the run and the footer on its last
+// block. Interior blocks are left untouched.
+func (self *BlockFile) writeFreeRun(head, length uint64) error {
+	if length == 0 {
+		return errors.Errorf("cannot write an empty free run at %d", head)
+	}
+	headIndex := self.offsetIndex(head)
+	tailOffset := self.blockOffset(headIndex + length - 1)
+	return self.Do(head, 1, func(bytes []byte) error {
+		hdr := loadFreeHdr(bytes)
+		hdr.magic = freeMagic
+		hdr.length = length
+		return self.Do(tailOffset, 1, func(tailBlock []byte) error {
+			ftr := loadFreeFtr(tailBlock)
+			ftr.magic = freeMagic
+			ftr.head = head
 			return nil
 		})
 	})
 }
 
-func (self *BlockFile) pop_free() (offset uint64, err error) {
-	err = self.ctrl(func(ctrl *ctrlblk) error {
-		if ctrl.meta.free_head == 0 || ctrl.meta.free_len == 0 {
-			return errors.Errorf("No blocks free")
+// linkFreeRun inserts the run at the head of the free run list.
+func (self *BlockFile) linkFreeRun(ctrl *ctrlblk, head, length uint64) error {
+	oldHead := ctrl.meta.free_head
+	err := self.Do(head, 1, func(bytes []byte) error {
+		hdr := loadFreeHdr(bytes)
+		hdr.magic = freeMagic
+		hdr.prev = 0
+		hdr.next = oldHead
+		hdr.length = length
+		if oldHead != 0 {
+			return self.Do(oldHead, 1, func(oldBytes []byte) error {
+				loadFreeHdr(oldBytes).prev = head
+				return nil
+			})
 		}
-		offset = ctrl.meta.free_head
-		return self.Do(offset, 1, func(bytes []byte) error {
-			free := loadFreeBlk(bytes)
-			ctrl.meta.free_head = free.next
-			ctrl.meta.free_len -= 1
-			return nil
-		})
+		return nil
 	})
 	if err != nil {
+		return err
+	}
+	ctrl.meta.free_head = head
+	ctrl.meta.free_len += uint32(length)
+	return nil
+}
+
+// unlinkFreeRun removes the run from the doubly linked list, clears its
+// boundary tags and accounts for its blocks.
+func (self *BlockFile) unlinkFreeRun(ctrl *ctrlblk, head, length uint64) error {
+	var prevOff, nextOff uint64
+	err := self.Do(head, 1, func(bytes []byte) error {
+		hdr := loadFreeHdr(bytes)
+		if hdr.magic != freeMagic || hdr.length != length {
+			return errors.Errorf("invalid free run header at %d", head)
+		}
+		prevOff, nextOff = hdr.prev, hdr.next
+		hdr.magic = 0
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if prevOff == 0 {
+		ctrl.meta.free_head = nextOff
+	} else {
+		err = self.Do(prevOff, 1, func(bytes []byte) error {
+			loadFreeHdr(bytes).next = nextOff
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	if nextOff != 0 {
+		err = self.Do(nextOff, 1, func(bytes []byte) error {
+			loadFreeHdr(bytes).prev = prevOff
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	tailOffset := self.blockOffset(self.offsetIndex(head) + length - 1)
+	err = self.Do(tailOffset, 1, func(block []byte) error {
+		ftr := loadFreeFtr(block)
+		ftr.magic = 0
+		ftr.head = 0
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	ctrl.meta.free_len -= uint32(length)
+	return nil
+}
+
+// findFreeRun walks the free run list and returns the first run with at
+// least n blocks (first fit). The walk happens on the allocation path,
+// never on the single block Free path.
+func (self *BlockFile) findFreeRun(n uint64) (head, length uint64, err error) {
+	err = self.ctrl(func(ctrl *ctrlblk) error {
+		var lerr error
+		head, length, lerr = self.findFreeRunFrom(ctrl, n)
+		return lerr
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return head, length, nil
+}
+
+// countFreeRuns reports how many distinct free runs (contiguous free
+// segments) are currently tracked. It is primarily a test aid.
+func (self *BlockFile) countFreeRuns() (runs int, err error) {
+	err = self.ctrl(func(ctrl *ctrlblk) error {
+		cursor := ctrl.meta.free_head
+		for cursor != 0 {
+			_, _, lerr := self.readFreeHdr(cursor)
+			if lerr != nil {
+				return lerr
+			}
+			runs++
+			cursor = self.freeRunNext(cursor)
+		}
+		return nil
+	})
+	return runs, err
+}
+
+// checkFreeList verifies the free run list invariants: header/footer
+// boundary tags agree, prev/next links are consistent, runs stay inside
+// the file, runs never overlap or touch (they would have coalesced), and
+// the block accounting matches free_len. It is a test/diagnostic aid.
+func (self *BlockFile) checkFreeList() error {
+	return self.ctrl(func(ctrl *ctrlblk) error {
+		var prev uint64
+		cursor := ctrl.meta.free_head
+		var accounted uint64
+		type span struct {
+			start, end uint64
+		}
+		spans := make([]span, 0)
+		for cursor != 0 {
+			var hdr *freeblkHdr
+			err := self.Do(cursor, 1, func(bytes []byte) error {
+				hdr = loadFreeHdr(bytes)
+				if hdr.magic != freeMagic {
+					return errors.Errorf("run at %d has a bad magic", cursor)
+				}
+				if hdr.prev != prev {
+					return errors.Errorf("run at %d has prev %d, expected %d", cursor, hdr.prev, prev)
+				}
+				if hdr.length == 0 {
+					return errors.Errorf("run at %d has zero length", cursor)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			startIndex := self.offsetIndex(cursor)
+			endIndex := startIndex + hdr.length
+			if !self.validBlock(endIndex - 1) {
+				return errors.Errorf("run at %d extends past end of file", cursor)
+			}
+			tailOff := self.blockOffset(endIndex - 1)
+			err = self.Do(tailOff, 1, func(block []byte) error {
+				ftr := loadFreeFtr(block)
+				if ftr.magic != freeMagic || ftr.head != cursor {
+					return errors.Errorf("bad footer on run ending at %d", tailOff)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			spans = append(spans, span{startIndex, endIndex})
+			accounted += hdr.length
+			prev, cursor = cursor, hdr.next
+		}
+		if accounted != uint64(ctrl.meta.free_len) {
+			return errors.Errorf("free_len is %d but runs account for %d", ctrl.meta.free_len, accounted)
+		}
+		for i := range spans {
+			for j := i + 1; j < len(spans); j++ {
+				a, b := spans[i], spans[j]
+				if a.start < b.end && b.start < a.end {
+					return errors.Errorf("free runs %d and %d overlap", a.start, b.start)
+				}
+				if a.end == b.start || b.end == a.start {
+					return errors.Errorf("adjacent free runs at %d were not coalesced", a.start)
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// freeRunNext reads the next pointer of the run at offset.
+func (self *BlockFile) freeRunNext(offset uint64) uint64 {
+	var next uint64
+	err := self.Do(offset, 1, func(bytes []byte) error {
+		next = loadFreeHdr(bytes).next
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
+	return next
+}
+
+// Free the block at the given offset. The offset is in bytes from the
+// start of the file. The block is merged in O(1) with the free runs
+// immediately before and after it when they are physically adjacent; no
+// full free list traversal is performed.
+func (self *BlockFile) Free(offset uint64) error {
+	if offset == 0 || offset%uint64(self.blksize) != 0 {
+		return errors.Errorf("invalid free offset %d", offset)
+	}
+	blockIndex := self.offsetIndex(offset)
+	if !self.validBlock(blockIndex) {
+		return errors.Errorf("free offset %d is outside the file", offset)
+	}
+	return self.ctrl(func(ctrl *ctrlblk) error {
+		// Reject the obvious double free cases via the boundary tags.
+		// This must run before zeroing the block.
+		var doubleFree bool
+		err := self.Do(offset, 1, func(bytes []byte) error {
+			if loadFreeHdr(bytes).magic == freeMagic {
+				doubleFree = true
+			}
+			ftr := loadFreeFtr(bytes)
+			if ftr.magic == freeMagic && ftr.head == offset {
+				doubleFree = true
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if doubleFree {
+			return errors.Errorf("block at %d is already free", offset)
+		}
+		// Zero the block so every stale boundary tag from a prior
+		// allocation is gone before this block joins the free set.
+		if _, err := self.zero(offset, 1); err != nil {
+			return err
+		}
+
+		runHead := offset
+		runLen := uint64(1)
+
+		nextHead, nextLen, hasNext, err := self.nextFreeRun(blockIndex)
+		if err != nil {
+			return err
+		}
+		if hasNext {
+			if err := self.unlinkFreeRun(ctrl, nextHead, nextLen); err != nil {
+				return err
+			}
+			runLen += nextLen
+		}
+
+		prevHead, prevLen, hasPrev, err := self.prevFreeRun(blockIndex)
+		if err != nil {
+			return err
+		}
+		if hasPrev {
+			if err := self.unlinkFreeRun(ctrl, prevHead, prevLen); err != nil {
+				return err
+			}
+			runHead = prevHead
+			runLen += prevLen
+		}
+
+		if err := self.writeFreeRun(runHead, runLen); err != nil {
+			return err
+		}
+		if err := self.linkFreeRun(ctrl, runHead, runLen); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// takeFromRun removes n blocks from the front of the free run at head.
+// The remaining suffix stays in the list as a trimmed run.
+func (self *BlockFile) takeFromRun(ctrl *ctrlblk, head, runLen, n uint64) (offset uint64, err error) {
+	if err := self.unlinkFreeRun(ctrl, head, runLen); err != nil {
 		return 0, err
 	}
-	return offset, nil
+	if runLen > n {
+		newHead := head + n*uint64(self.blksize)
+		newLen := runLen - n
+		if err := self.writeFreeRun(newHead, newLen); err != nil {
+			return 0, err
+		}
+		if err := self.linkFreeRun(ctrl, newHead, newLen); err != nil {
+			return 0, err
+		}
+	}
+	return head, nil
 }
 
 func (self *BlockFile) zero(offset uint64, n int) (uint64, error) {
@@ -510,15 +905,18 @@ func (self *BlockFile) Allocate() (offset uint64, err error) {
 	if !self.opened {
 		return 0, errors.Errorf("File is not open")
 	}
-	var resize bool = false
+	var resize bool
 	err = self.ctrl(func(ctrl *ctrlblk) error {
-		var err error
-		if ctrl.meta.free_len > 0 {
-			offset, err = self.pop_free()
-		} else {
+		if ctrl.meta.free_len == 0 {
 			resize = true
+			return nil
 		}
-		return err
+		head, length, lerr := self.findFreeRunFrom(ctrl, 1)
+		if lerr != nil {
+			return lerr
+		}
+		offset, lerr = self.takeFromRun(ctrl, head, length, 1)
+		return lerr
 	})
 	if err != nil {
 		return 0, err
@@ -533,22 +931,53 @@ func (self *BlockFile) Allocate() (offset uint64, err error) {
 }
 
 // Allocate n blocks. Return the offset of the first block. These are
-// guarranteed to be sequential. This always causes a file resize at the
-// moment.
+// guaranteed to be sequential. A contiguous free run is reused whenever
+// one exists; the file is only extended (at the tail) when no run is
+// large enough.
 func (self *BlockFile) AllocateBlocks(n int) (offset uint64, err error) {
 	if !self.opened {
 		return 0, errors.Errorf("File is not open")
 	}
-	offset, err = self.alloc(n)
+	if n <= 0 {
+		return 0, errors.Errorf("AllocateBlocks requires a positive count, got %d", n)
+	}
+	var resize bool
+	err = self.ctrl(func(ctrl *ctrlblk) error {
+		head, length, lerr := self.findFreeRunFrom(ctrl, uint64(n))
+		if lerr != nil {
+			resize = true
+			return nil
+		}
+		offset, lerr = self.takeFromRun(ctrl, head, length, uint64(n))
+		return lerr
+	})
 	if err != nil {
 		return 0, err
 	}
-	/*amt := uint64(self.blksize) * uint64(n)
-	errno := C.is_sequential(self.mmap, C.size_t(offset), C.size_t(amt))
-	if errno != 0 {
-		return 0, errors.Errorf("is_sequential failed, %d", errno)
-	}*/
+	if resize {
+		offset, err = self.alloc(n)
+		if err != nil {
+			return 0, err
+		}
+	}
 	return self.zero(offset, n)
+}
+
+// findFreeRunFrom scans the free run list starting at the control
+// block's list head and returns the first run of at least n blocks.
+func (self *BlockFile) findFreeRunFrom(ctrl *ctrlblk, n uint64) (head, length uint64, err error) {
+	cursor := ctrl.meta.free_head
+	for cursor != 0 {
+		h, runLen, lerr := self.readFreeHdr(cursor)
+		if lerr != nil {
+			return 0, 0, lerr
+		}
+		if runLen >= n {
+			return h, runLen, nil
+		}
+		cursor = self.freeRunNext(cursor)
+	}
+	return 0, 0, errors.Errorf("no free run of %d blocks available", n)
 }
 
 // Load the blocks at the give offset then call the callback, `do`,
