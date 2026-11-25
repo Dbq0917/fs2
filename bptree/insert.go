@@ -492,10 +492,15 @@ func (self *BpTree) internalSplit(n uint64, key []byte, ptr uint64) (a, b uint64
 func (self *BpTree) leafSplit(n uint64, vkey, key, value []byte) (a, b uint64, err error) {
 	// log.Println("leafSplit", n, key)
 	var isPure bool = false
+	var insertIdx int
 	a = n
 	err = self.doLeaf(a, func(n *leaf) (err error) {
 		isPure = n.pure(self.varchar)
-		return nil
+		if isPure {
+			return nil
+		}
+		insertIdx, _, err = find(self.varchar, n, key)
+		return err
 	})
 	if err != nil {
 		return 0, 0, err
@@ -513,9 +518,12 @@ func (self *BpTree) leafSplit(n uint64, vkey, key, value []byte) (a, b uint64, e
 			return err
 		}
 		return self.doLeaf(b, func(m *leaf) (err error) {
-			err = n.balance(self.varchar, m)
+			err = n.balanceForInsert(self.varchar, m, insertIdx)
 			if err != nil {
 				return err
+			}
+			if m.meta.keyCount == 0 {
+				return errors.Errorf("leaf split produced an empty right leaf")
 			}
 			return m.doKeyAt(self.varchar, 0, func(mk []byte) error {
 				if self.meta.flags&consts.VARCHAR_KEYS != 0 {

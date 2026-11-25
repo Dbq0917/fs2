@@ -96,12 +96,35 @@ func (n *internal) balancePoint(v *Varchar) (int, error) {
 	return noSplitBalancePoint(v, n, m)
 }
 
-func (n *leaf) balancePoint(v *Varchar) (int, error) {
+func (n *leaf) balancePoint(v *Varchar, insertIdx ...int) (int, error) {
 	if n.meta.keyCount == 0 {
 		return 0, nil
 	}
-	m := int(n.meta.keyCount) / 2
+	count := n.keyCount()
+	m := count / 2
+	if len(insertIdx) > 0 {
+		idx := insertIdx[0]
+		if idx >= count {
+			m = count - 1
+		} else if idx <= 0 {
+			m = 1
+		}
+	}
 	return noSplitBalancePoint(v, n, m)
+}
+
+func (a *leaf) balanceForInsert(v *Varchar, b *leaf, insertIdx int) error {
+	if b.meta.keyCount != 0 {
+		return errors.Errorf("b was not empty")
+	}
+	m, err := a.balancePoint(v, insertIdx)
+	if err != nil {
+		return err
+	}
+	if m == 0 {
+		return nil
+	}
+	return a.balanceAt(b, m)
 }
 
 /*
